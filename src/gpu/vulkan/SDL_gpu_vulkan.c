@@ -514,7 +514,8 @@ typedef enum VulkanBufferType
 {
     VULKAN_BUFFER_TYPE_GPU,
     VULKAN_BUFFER_TYPE_UNIFORM,
-    VULKAN_BUFFER_TYPE_TRANSFER
+    VULKAN_BUFFER_TYPE_TRANSFER,
+    VULKAN_BUFFER_TYPE_TRANSFER_DOWNLOAD
 } VulkanBufferType;
 
 struct VulkanBuffer
@@ -2328,6 +2329,20 @@ static Uint8 VULKAN_INTERNAL_BindMemoryForBuffer(
 
         tolerableMemoryPropertyFlags |=
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    } else if (type == VULKAN_BUFFER_TYPE_TRANSFER_DOWNLOAD) {
+        /* The host reads download buffers, and reading uncached memory is
+         * very slow. Some integrated GPUs that do not share a cache with the
+         * CPU offer cached memory only without HOST_COHERENT, so coherency is
+         * not required here: mapping invalidates non-coherent memory.
+         */
+        requiredMemoryPropertyFlags |=
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+
+        preferredMemoryPropertyFlags |=
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+        tolerableMemoryPropertyFlags |=
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     } else {
         SDL_LogError(SDL_LOG_CATEGORY_GPU, "Unrecognized buffer type!");
         return 0;
@@ -2377,7 +2392,7 @@ static Uint8 VULKAN_INTERNAL_BindMemoryForBuffer(
                     renderer->outofBARMemoryWarning = 1;
                 }
             }
-        } else if (type == VULKAN_BUFFER_TYPE_TRANSFER) {
+        } else if (type == VULKAN_BUFFER_TYPE_TRANSFER || type == VULKAN_BUFFER_TYPE_TRANSFER_DOWNLOAD) {
             if (!renderer->integratedMemoryNotification) {
                 if ((renderer->memoryProperties.memoryTypes[selectedMemoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
                     SDL_LogInfo(SDL_LOG_CATEGORY_GPU, "Integrated memory detected, allocating TransferBuffers on device-local memory!");
@@ -7036,7 +7051,7 @@ static SDL_GPUTransferBuffer *VULKAN_CreateTransferBuffer(
         (VulkanRenderer *)driverData,
         (VkDeviceSize)size,
         0,
-        VULKAN_BUFFER_TYPE_TRANSFER,
+        usage == SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD ? VULKAN_BUFFER_TYPE_TRANSFER_DOWNLOAD : VULKAN_BUFFER_TYPE_TRANSFER,
         true, // Dedicated allocations preserve the data even if a defrag is triggered.
         debugName);
 }
@@ -8843,9 +8858,25 @@ static void *VULKAN_MapTransferBuffer(
             transferBufferContainer);
     }
 
+    VulkanMemoryAllocation *allocation = transferBufferContainer->activeBuffer->usedRegion->allocation;
     Uint8 *bufferPointer =
-        transferBufferContainer->activeBuffer->usedRegion->allocation->mapPointer +
+        allocation->mapPointer +
         transferBufferContainer->activeBuffer->usedRegion->resourceOffset;
+
+    // Make the device's writes visible in non-coherent memory. Transfer buffers have dedicated allocations, so the
+    // whole allocation is invalidated, which meets nonCoherentAtomSize alignment.
+    if (transferBufferContainer->activeBuffer->type == VULKAN_BUFFER_TYPE_TRANSFER_DOWNLOAD &&
+        !(renderer->memoryProperties.memoryTypes[allocation->allocator->memoryTypeIndex].propertyFlags &
+          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+        VkMappedMemoryRange range;
+        range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        range.pNext = NULL;
+        range.memory = allocation->memory;
+        range.offset = 0;
+        range.size = VK_WHOLE_SIZE;
+        VkResult result = renderer->vkInvalidateMappedMemoryRanges(renderer->logicalDevice, 1, &range);
+        CHECK_VULKAN_ERROR_AND_RETURN(result, vkInvalidateMappedMemoryRanges, NULL);
+    }
 
     return bufferPointer;
 }
